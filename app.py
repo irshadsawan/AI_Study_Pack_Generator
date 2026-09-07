@@ -1,27 +1,65 @@
 import os
+import time
 import streamlit as st
 from groq import Groq
 
-st.set_page_config(page_title="AI Study Pack Generator", page_icon="📚", layout="wide")
+st.set_page_config(
+    page_title="AI Study Pack Generator",
+    page_icon="📚",
+    layout="wide",
+)
 
 # -----------------------------
 # Configuration
 # -----------------------------
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 
+# Conservative limits to help keep requests below the Groq TPM limit.
+MAX_PLAN_CHARS = 2200
+MAX_CONTENT_CHARS = 5000
+MAX_ASSESSMENT_CHARS = 3000
+MAX_REVIEW_CHARS = 1800
+
+
 def get_client():
     """Load GROQ_API_KEY from Streamlit Secrets first, then environment."""
     api_key = None
+
     try:
         api_key = st.secrets.get("GROQ_API_KEY")
     except Exception:
         pass
+
     api_key = api_key or os.getenv("GROQ_API_KEY")
+
     if not api_key:
         raise RuntimeError(
             "GROQ_API_KEY is missing. Add it to Streamlit Secrets or your environment."
         )
+
     return Groq(api_key=api_key)
+
+
+def limit_text(text, max_chars):
+    """Keep context small enough for multi-stage API requests."""
+    if not text:
+        return ""
+
+    text = str(text).strip()
+
+    if len(text) <= max_chars:
+        return text
+
+    # Keep the beginning and end because both often contain useful context.
+    head_size = int(max_chars * 0.75)
+    tail_size = max_chars - head_size
+
+    return (
+        text[:head_size]
+        + "\n\n[... context shortened to reduce API request size ...]\n\n"
+        + text[-tail_size:]
+    )
+
 
 def call_ai(
     client,
@@ -29,81 +67,8 @@ def call_ai(
     user_prompt,
     model=DEFAULT_MODEL,
     temperature=0.4,
-    max_tokens=1200
-):
-    response = client.chat.completions.create(
-        model=model,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-
-    if not response.choices:
-        raise RuntimeError("The AI API returned no choices.")
-
-    message = response.choices[0].message
-
-    content = getattr(message, "content", None)
-
-    if not content or not content.strip():
-        finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
-
-        raise RuntimeError(
-            f"The AI returned an empty response. "
-            f"Finish reason: {finish_reason}"
-        )
-
-    return content.strip()
-def limit_text(text, max_chars):
-    if not text:
-        return ""
-
-    text = str(text)
-
-    if len(text) <= max_chars:
-        return text
-
-    return text[:max_chars] + "\n\n[Context shortened]"
-
-# -----------------------------
-# Workflow stages
-# -----------------------------
-def stage_planning(client, topic, level, duration, hours, goals):
-    system = """You are the Planning Agent of an AI Study Pack Generator.
-Create a practical personalized study plan. Do not invent academic sources.
-Return clear Markdown with: learning objectives, prerequisites, schedule,
-key concepts, and recommended study sequence."""
-    prompt = f"""
-Topic: {topic}
-Student level: {level}
-Duration: {duration} weeks
-Study time: {hours} hours/day
-Student goals: {goals or "General mastery"}
-
-Create a structured plan that can be passed to later AI agents.
-"""
-    return call_ai(client, system, prompt)
-
-def stage_content(client, topic, level, plan):
-    system = """You are the Content Generation Agent.
-Using the supplied plan, create concise but useful study notes.
-Explain concepts accurately at the requested level. Include examples,
-important terms, common mistakes, and a short revision checklist."""
-    prompt = f"""
-Topic: {topic}
-Level: {level}
-
-PLANNING CONTEXT:
-{plan}
-
-Generate the study content based strictly on this plan.
-"""
-    return call_ai(client, system, prompt)
-
-def stage_assessment(client, topic, level, content):
+    max_tokens=1000,
+    retries=2,
     system = """You are the Assessment Agent.
 Create a balanced assessment from the supplied study content.
 Include 8 multiple-choice questions, 4 short-answer questions, and
