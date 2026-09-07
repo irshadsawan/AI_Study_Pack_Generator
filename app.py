@@ -7,7 +7,7 @@ st.set_page_config(page_title="AI Study Pack Generator", page_icon="📚", layou
 # -----------------------------
 # Configuration
 # -----------------------------
-DEFAULT_MODEL = "llama-3.3-70b-versatile"
+DEFAULT_MODEL = "openai/gpt-oss-120b"
 
 def get_client():
     """Load GROQ_API_KEY from Streamlit Secrets first, then environment."""
