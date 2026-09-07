@@ -23,15 +23,24 @@ def get_client():
         )
     return Groq(api_key=api_key)
 
-def call_ai(client, system_prompt, user_prompt, model=DEFAULT_MODEL, temperature=0.4):
+def call_ai(
+    client,
+    system_prompt,
+    user_prompt,
+    model=DEFAULT_MODEL,
+    temperature=0.4,
+    max_tokens=1200
+):
     response = client.chat.completions.create(
         model=model,
         temperature=temperature,
+        max_tokens=max_tokens,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
     )
+
     return response.choices[0].message.content.strip()
 
 # -----------------------------
