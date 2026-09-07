@@ -5,7 +5,7 @@ from groq import Groq
 
 st.set_page_config(
     page_title="AI Study Pack Generator",
-    page_icon="📚",
+    page_icon="ðŸ“š",
     layout="wide",
 )
 
@@ -61,50 +61,433 @@ def limit_text(text, max_chars):
     )
 
 
-def call_ai(
-    client,
-    system_prompt,
-    user_prompt,
-    model=DEFAULT_MODEL,
-    temperature=0.4,
-    max_tokens=1000,
-    retries=2,
+def call_ai(client, system_prompt, user_prompt, model=DEFAULT_MODEL, temperature=0.4, max_tokens=1000, retries=2):
+    """Call Groq with conservative output limits and retry empty responses."""
+    last_error = None
+
+    for attempt in range(retries + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+            if not response.choices:
+                raise RuntimeError("The AI API returned no response choices.")
+
+            choice = response.choices[0]
+            message = choice.message
+            content = getattr(message, "content", None)
+
+            if content and str(content).strip():
+                return str(content).strip()
+
+            finish_reason = getattr(choice, "finish_reason", "unknown")
+            last_error = RuntimeError(
+                f"The AI returned an empty response (finish reason: {finish_reason})."
+            )
+
+        except Exception as exc:
+            last_error = exc
+
+        # Short retry delay. Do not retry forever.
+        if attempt < retries:
+            time.sleep(1.5 * (attempt + 1))
+
+    raise RuntimeError(str(last_error))
+
+
+# -----------------------------
+# Workflow stages
+# -----------------------------
+def stage_planning(client, topic, level, duration, hours, goals):
+    system = """You are the Planning Agent of an AI Study Pack Generator.
+
+Create a practical, personalized study plan. Do not invent academic sources.
+Return concise Markdown containing:
+1. Learning objectives
+2. Prerequisites
+3. Weekly schedule
+4. Key concepts
+5. Recommended study sequence
+
+Keep the response under 500 words."""
+
+    prompt = f"""Topic: {topic}
+Student level: {level}
+Duration: {duration} weeks
+Study time: {hours} hours/day
+Student goals: {goals or "General mastery"}
+
+Create a structured study plan."""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.4,
+        max_tokens=700,
+    )
+
+
+def stage_content(client, topic, level, plan):
+    system = """You are the Content Generation Agent.
+
+Using the supplied study plan, create concise, useful study notes.
+Explain concepts accurately at the requested level.
+
+Include:
+- Main concepts
+- Important terms
+- Short examples
+- Common mistakes
+- A revision checklist
+
+Do not repeat the entire study plan.
+Keep the response under 1,000 words."""
+
+    prompt = f"""Topic: {topic}
+Level: {level}
+
+PLANNING CONTEXT:
+{limit_text(plan, MAX_PLAN_CHARS)}
+
+Generate the study content based on this plan."""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.4,
+        max_tokens=1200,
+    )
+
+
+def stage_assessment(client, topic, level, content):
     system = """You are the Assessment Agent.
-Create a balanced assessment from the supplied study content.
-Include 8 multiple-choice questions, 4 short-answer questions, and
-2 application questions. Put an answer key at the end. Do not assess
-material that is not reasonably covered by the content."""
-    prompt = f"""
-Topic: {topic}
+
+Create an assessment using only the supplied study content.
+
+Include:
+- 6 multiple-choice questions
+- 3 short-answer questions
+- 1 application question
+- An answer key
+
+Keep questions concise. Do not test material that is not covered by the content."""
+
+    prompt = f"""Topic: {topic}
 Level: {level}
 
 STUDY CONTENT:
-{content}
+{limit_text(content, MAX_CONTENT_CHARS)}
 
-Generate the assessment and answer key.
-"""
-    return call_ai(client, system, prompt, temperature=0.3)
+Generate the assessment and answer key."""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.3,
+        max_tokens=900,
+    )
+
 
 def stage_review(client, topic, plan, content, assessment):
-
     system = """You are the Review and Quality Agent.
 
-Review the study materials for:
-
+Audit the supplied study pack for:
 1. Alignment with the topic
 2. Factual consistency
-3. Missing objectives
+3. Missing learning objectives
 4. Unclear explanations
-5. Duplicated questions
+5. Duplicated or weak questions
 6. Mismatches between content and assessment
 
-Return ONLY:
-
+Return ONLY these Markdown sections:
 ## Strengths
 ## Issues Found
 ## Required Fixes
 ## Quality Score
 
+Do not rewrite the entire study pack.
+Keep the review under 500 words."""
+
+    prompt = f"""Topic: {topic}
+
+PLAN:
+{limit_text(plan, MAX_PLAN_CHARS)}
+
+CONTENT:
+{limit_text(content, MAX_CONTENT_CHARS)}
+
+ASSESSMENT:
+{limit_text(assessment, MAX_ASSESSMENT_CHARS)}
+
+Review the materials for quality and alignment."""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.2,
+        max_tokens=650,
+    )
+
+
+def stage_refinement(client, topic, level, plan, content, assessment, review):
+    system = """You are the Final Refinement Agent.
+
+Create a polished final study pack from the supplied material and review.
+
+Use exactly these Markdown headings:
+# Study Roadmap
+# Learning Objectives
+# Study Notes
+# Quick Revision
+# Practice Questions
+# Answer Key
+# Final Review Tips
+
+Use the quality review to fix important issues.
+Do not mention internal workflow stages or that you are an AI.
+Keep the final pack concise and useful."""
+
+    prompt = f"""Topic: {topic}
+Level: {level}
+
+PLAN SUMMARY:
+{limit_text(plan, 1600)}
+
+STUDY CONTENT:
+{limit_text(content, 4500)}
+
+ASSESSMENT:
+{limit_text(assessment, 2800)}
+
+QUALITY REVIEW:
+{limit_text(review, MAX_REVIEW_CHARS)}
+
+Create the final refined study pack."""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.3,
+        max_tokens=1400,
+    )
+
+
+# -----------------------------
+# Safe stage runner
+# -----------------------------
+def run_stage(name, fn, *args):
+    try:
+        with st.status(f"{name} in progress...", expanded=False):
+            result = fn(*args)
+
+        if not result or not str(result).strip():
+            raise RuntimeError("The AI returned an empty response.")
+
+        return result, None
+
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+# -----------------------------
+# User interface
+# -----------------------------
+st.title("ðŸ“š AI Study Pack Generator")
+st.caption(
+    "Multi-stage AI workflow: Planning â†’ Content â†’ Assessment â†’ Review â†’ Refinement"
+)
+
+with st.sidebar:
+    st.header("Student Profile")
+
+    topic = st.text_input(
+        "Study topic",
+        placeholder="e.g., Machine Learning",
+    )
+
+    level = st.selectbox(
+        "Level",
+        ["Beginner", "Intermediate", "Advanced"],
+    )
+
+    duration = st.number_input(
+        "Duration (weeks)",
+        min_value=1,
+        max_value=52,
+        value=4,
+    )
+
+    hours = st.number_input(
+        "Study hours/day",
+        min_value=0.5,
+        max_value=12.0,
+        value=2.0,
+        step=0.5,
+    )
+
+    goals = st.text_area(
+        "Learning goals",
+        placeholder="What do you want to achieve?",
+    )
+
+    generate = st.button(
+        "ðŸš€ Generate Study Pack",
+        type="primary",
+        use_container_width=True,
+    )
+
+
+if generate:
+    if not topic.strip():
+        st.error("Please enter a study topic.")
+        st.stop()
+
+    try:
+        client = get_client()
+    except Exception as exc:
+        st.error(str(exc))
+        st.info(
+            "For Streamlit Cloud, add GROQ_API_KEY under Settings â†’ Secrets."
+        )
+        st.stop()
+
+    # Clear only results from a previous generation.
+    for key in ["plan", "content", "assessment", "review", "final"]:
+        st.session_state.pop(key, None)
+
+    # Stage 1
+    plan, err = run_stage(
+        "Stage 1 â€” Planning",
+        stage_planning,
+        client,
+        topic,
+        level,
+        duration,
+        hours,
+        goals,
+    )
+
+    if err:
+        st.error(f"Planning failed: {err}")
+        st.stop()
+
+    st.session_state["plan"] = plan
+
+    # Stage 2
+    content, err = run_stage(
+        "Stage 2 â€” Content Generation",
+        stage_content,
+        client,
+        topic,
+        level,
+        plan,
+    )
+
+    if err:
+        st.error(f"Content generation failed: {err}")
+        st.stop()
+
+    st.session_state["content"] = content
+
+    # Stage 3
+    assessment, err = run_stage(
+        "Stage 3 â€” Assessment",
+        stage_assessment,
+        client,
+        topic,
+        level,
+        content,
+    )
+
+    if err:
+        st.error(f"Assessment failed: {err}")
+        st.stop()
+
+    st.session_state["assessment"] = assessment
+
+    # Stage 4
+    review, err = run_stage(
+        "Stage 4 â€” Review & Quality Check",
+        stage_review,
+        client,
+        topic,
+        plan,
+        content,
+        assessment,
+    )
+
+    if err:
+        st.error(f"Review failed: {err}")
+        st.stop()
+
+    st.session_state["review"] = review
+
+    # Stage 5
+    final_pack, err = run_stage(
+        "Stage 5 â€” Refinement",
+        stage_refinement,
+        client,
+        topic,
+        level,
+        plan,
+        content,
+        assessment,
+        review,
+    )
+
+    if err:
+        st.error(f"Refinement failed: {err}")
+        st.stop()
+
+    st.session_state["final"] = final_pack
+    st.success("Study pack generated successfully.")
+
+
+# -----------------------------
+# Results
+# -----------------------------
+if "final" in st.session_state:
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["Final Pack", "Planning", "Content", "Assessment", "Review"]
+    )
+
+    with tab1:
+        st.markdown(st.session_state["final"])
+        st.download_button(
+            "â¬‡ï¸ Download Study Pack",
+            data=st.session_state["final"],
+            file_name="ai_study_pack.md",
+            mime="text/markdown",
+        )
+
+    with tab2:
+        st.markdown(st.session_state["plan"])
+
+    with tab3:
+        st.markdown(st.session_state["content"])
+
+    with tab4:
+        st.markdown(st.session_state["assessment"])
+
+    with tab5:
+        st.markdown(st.session_state["review"])
+
+else:
+    st.info(
+        "Enter your study details in the sidebar and click Generate Study Pack."
+    )
 Keep the review concise and under 600 words.
 Do not rewrite the entire study pack.
 """
