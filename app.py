@@ -41,7 +41,32 @@ def call_ai(
         ],
     )
 
-    return response.choices[0].message.content.strip()
+    if not response.choices:
+        raise RuntimeError("The AI API returned no choices.")
+
+    message = response.choices[0].message
+
+    content = getattr(message, "content", None)
+
+    if not content or not content.strip():
+        finish_reason = getattr(response.choices[0], "finish_reason", "unknown")
+
+        raise RuntimeError(
+            f"The AI returned an empty response. "
+            f"Finish reason: {finish_reason}"
+        )
+
+    return content.strip()
+def limit_text(text, max_chars):
+    if not text:
+        return ""
+
+    text = str(text)
+
+    if len(text) <= max_chars:
+        return text
+
+    return text[:max_chars] + "\n\n[Context shortened]"
 
 # -----------------------------
 # Workflow stages
@@ -96,57 +121,51 @@ Generate the assessment and answer key.
     return call_ai(client, system, prompt, temperature=0.3)
 
 def stage_review(client, topic, plan, content, assessment):
-    system = """You are the Review/Quality Agent.
-Audit the study pack for factual consistency, missing objectives,
-unclear explanations, duplicated questions, and mismatches between
-content and assessment. Return:
-1. Strengths
-2. Issues found
-3. Required fixes
-4. Quality score out of 10.
-Do not rewrite the whole pack."""
+
+    system = """You are the Review and Quality Agent.
+
+Review the study materials for:
+
+1. Alignment with the topic
+2. Factual consistency
+3. Missing objectives
+4. Unclear explanations
+5. Duplicated questions
+6. Mismatches between content and assessment
+
+Return ONLY:
+
+## Strengths
+## Issues Found
+## Required Fixes
+## Quality Score
+
+Keep the review concise and under 600 words.
+Do not rewrite the entire study pack.
+"""
+
     prompt = f"""
 Topic: {topic}
 
 PLAN:
-{plan}
+{limit_text(plan, 2000)}
 
 CONTENT:
-{content}
+{limit_text(content, 4000)}
 
 ASSESSMENT:
-{assessment}
+{limit_text(assessment, 2500)}
 
-Review all stages for quality and alignment.
+Review these materials.
 """
-    return call_ai(client, system, prompt, temperature=0.2)
 
-def stage_refinement(client, topic, level, plan, content, assessment, review):
-    system = """You are the Final Refinement Agent.
-Produce the final polished study pack using all previous context and
-the review findings. Preserve useful content, fix identified issues,
-and keep the pack practical for studying. Use Markdown headings:
-Study Roadmap, Learning Objectives, Study Notes, Quick Revision,
-Practice Questions, Answer Key, and Final Review Tips."""
-    prompt = f"""
-Topic: {topic}
-Level: {level}
-
-PLAN:
-{plan}
-
-CONTENT:
-{content}
-
-ASSESSMENT:
-{assessment}
-
-QUALITY REVIEW:
-{review}
-
-Create the final refined study pack.
-"""
-    return call_ai(client, system, prompt, temperature=0.3)
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.2,
+        max_tokens=800
+    )
 
 # -----------------------------
 # Safe stage runner / error handling
@@ -231,36 +250,48 @@ if generate:
     st.session_state["review"] = review
 
     # 5. Refinement; full context is passed to final agent
-    final_pack, err = run_stage(
-        "Stage 5 — Refinement",
-        stage_refinement, client, topic, level, plan, content, assessment, review
-    )
-    if err:
-        st.error(f"Refinement failed: {err}")
-        st.stop()
-    st.session_state["final"] = final_pack
+    def stage_refinement(client, topic, level, plan, content, assessment, review):
 
-    st.success("Study pack generated successfully.")
+    system = """You are the Final Refinement Agent.
 
-if "final" in st.session_state:
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
-        ["Final Pack", "Planning", "Content", "Assessment", "Review"]
+Create a polished and concise final study pack.
+
+Use these Markdown sections:
+
+# Study Roadmap
+# Learning Objectives
+# Study Notes
+# Quick Revision
+# Practice Questions
+# Answer Key
+# Final Review Tips
+
+Use the quality review to improve the material.
+Do not mention that you are an AI.
+Keep the final study pack concise.
+"""
+
+    prompt = f"""
+Topic: {topic}
+Level: {level}
+
+PLAN SUMMARY:
+{limit_text(plan, 1500)}
+
+STUDY CONTENT:
+{limit_text(content, 4500)}
+
+ASSESSMENT:
+{limit_text(assessment, 2500)}
+
+QUALITY REVIEW:
+{limit_text(review, 2000)}
+"""
+
+    return call_ai(
+        client,
+        system,
+        prompt,
+        temperature=0.3,
+        max_tokens=1500
     )
-    with tab1:
-        st.markdown(st.session_state["final"])
-        st.download_button(
-            "⬇️ Download Study Pack",
-            data=st.session_state["final"],
-            file_name="ai_study_pack.md",
-            mime="text/markdown",
-        )
-    with tab2:
-        st.markdown(st.session_state["plan"])
-    with tab3:
-        st.markdown(st.session_state["content"])
-    with tab4:
-        st.markdown(st.session_state["assessment"])
-    with tab5:
-        st.markdown(st.session_state["review"])
-else:
-    st.info("Enter your study details in the sidebar and click Generate Study Pack.")
