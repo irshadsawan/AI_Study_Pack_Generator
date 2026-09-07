@@ -12,7 +12,7 @@ st.set_page_config(
 # -----------------------------
 # Configuration
 # -----------------------------
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 # Conservative limits to help keep requests below the Groq TPM limit.
 MAX_PLAN_CHARS = 2200
